@@ -1,0 +1,493 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "CloudFormation template for deploying a code analysis solution using AWS Bedrock Claude"
+
+Parameters:
+  AWSAccountId:
+    Type: String
+    Description: AWS Account ID
+    AllowedPattern: "[0-9]{12}"
+
+  S3BucketName:
+    Type: String
+    Description: Name of the S3 bucket to store code files
+    AllowedPattern: "[a-zA-Z0-9.-]*"
+
+Resources:
+  # S3 Bucket for storing code files
+  CodeStorageBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref S3BucketName
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  # Lambda execution role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::${S3BucketName}
+                  - !Sub arn:aws:s3:::${S3BucketName}/*
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - "arn:aws:bedrock:*::foundation-model/*"
+              - Effect: Allow
+                Action:
+                  - bedrock:ListFoundationModels
+                  - bedrock:GetFoundationModel
+                Resource: "*"
+
+  # Lambda function for processing code and interacting with Bedrock
+  CodeAnalysisFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+
+          def handler(event, context):
+              try:
+                  print("Received event:", json.dumps(event))  # Debug log
+                  
+                  # Parse the incoming event body
+                  if isinstance(event.get('body'), str):
+                      body = json.loads(event['body'])
+                  else:
+                      body = event.get('body', {})
+                  
+                  print("Parsed body:", json.dumps(body))  # Debug log
+                  
+                  file_key = body.get('file_key')
+                  question = body.get('question')
+                  
+                  # Initialize Bedrock client
+                  bedrock = boto3.client(
+                      service_name='bedrock-runtime',
+                      region_name='us-east-1'
+                  )
+                  print("Initialized Bedrock client")  # Debug log
+                  
+                  # If file_key is provided, get file content from S3
+                  file_content = ""
+                  if file_key:
+                      s3 = boto3.client('s3')
+                      bucket = os.environ['BUCKET_NAME']
+                      try:
+                          print(f"Attempting to read file {file_key} from bucket {bucket}")  # Debug log
+                          response = s3.get_object(Bucket=bucket, Key=file_key)
+                          file_content = response['Body'].read().decode('utf-8')
+                          print("Successfully read file from S3")  # Debug log
+                      except Exception as e:
+                          print(f"Error reading file from S3: {str(e)}")
+                          file_content = f"Error reading file: {str(e)}"
+                  
+                  # Prepare message for Claude
+                  messages = [
+                      {
+                          "role": "user",
+                          "content": f"""Here is the code from the file:
+                          {file_content if file_content else 'No file content provided'}
+                          
+                          Question:
+                          {question}
+                          
+                          Please analyze the code and answer the question."""
+                      }
+                  ]
+                  
+                  print("Preparing to call Bedrock")  # Debug log
+                  
+                  # Call Bedrock with proper parameters
+                  try:
+                      response = bedrock.invoke_model(
+                          modelId='anthropic.claude-3-sonnet-20240229-v1:0',
+                          contentType='application/json',
+                          accept='application/json',
+                          body=json.dumps({
+                              "messages": messages,
+                              "max_tokens": 2048,
+                              "temperature": 0.7,
+                              "anthropic_version": "bedrock-2023-05-31"
+                          })
+                      )
+                      print("Successfully called Bedrock")  # Debug log
+                      
+                      # Parse response
+                      response_body = json.loads(response['body'].read().decode())
+                      assistant_message = response_body['content'][0]['text']
+                      print("Successfully parsed Bedrock response")  # Debug log
+                      
+                      return {
+                          'statusCode': 200,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*',
+                              'Access-Control-Allow-Headers': 'Content-Type',
+                              'Access-Control-Allow-Methods': 'OPTIONS,POST'
+                          },
+                          'body': json.dumps({
+                              'message': assistant_message
+                          })
+                      }
+                  except Exception as bedrock_error:
+                      print(f"Error calling Bedrock: {str(bedrock_error)}")  # Debug log
+                      raise bedrock_error
+                  
+              except Exception as e:
+                  print(f"Error in Lambda: {str(e)}")
+                  import traceback
+                  print("Full traceback:", traceback.format_exc())  # Full error traceback
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*',
+                          'Access-Control-Allow-Headers': 'Content-Type',
+                          'Access-Control-Allow-Methods': 'OPTIONS,POST'
+                      },
+                      'body': json.dumps({
+                          'error': f"Error processing request: {str(e)}"
+                      })
+                  }
+      Runtime: python3.9
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref S3BucketName
+
+  # API Gateway REST API
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: CodeAnalysisAPI
+      Description: API for code analysis chat interface
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  # Enable CORS for the entire API
+  ApiGatewayCORSSettings:
+    Type: "AWS::ApiGateway::GatewayResponse"
+    Properties:
+      ResponseParameters:
+        gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+        gatewayresponse.header.Access-Control-Allow-Headers: "'*'"
+        gatewayresponse.header.Access-Control-Allow-Methods: "'*'"
+      ResponseType: DEFAULT_4XX
+      RestApiId: !Ref ApiGateway
+
+  ApiGatewayCORSSettings5XX:
+    Type: "AWS::ApiGateway::GatewayResponse"
+    Properties:
+      ResponseParameters:
+        gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+        gatewayresponse.header.Access-Control-Allow-Headers: "'*'"
+        gatewayresponse.header.Access-Control-Allow-Methods: "'*'"
+      ResponseType: DEFAULT_5XX
+      RestApiId: !Ref ApiGateway
+
+  # API Gateway Resource
+  ApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: analyze
+      RestApiId: !Ref ApiGateway
+
+  # API Gateway Method
+  ApiMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      HttpMethod: POST
+      ResourceId: !Ref ApiResource
+      RestApiId: !Ref ApiGateway
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CodeAnalysisFunction.Arn}/invocations
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # Enable CORS on the resource
+  ResourceCORS:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: |
+                {}
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: |
+            {"statusCode": 200}
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          ResponseModels:
+            application/json: "Empty"
+      ResourceId: !Ref ApiResource
+      RestApiId: !Ref ApiGateway
+
+  # API Gateway Deployment
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: ApiMethod
+    Properties:
+      RestApiId: !Ref ApiGateway
+      StageName: prod
+
+  # Lambda Permission for API Gateway
+  LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref CodeAnalysisFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/*/*
+
+  # Simple chat interface hosted in S3
+  ChatInterfaceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      WebsiteConfiguration:
+        IndexDocument: index.html
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+
+  ChatInterfaceBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ChatInterfaceBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action: s3:GetObject
+            Resource: !Sub ${ChatInterfaceBucket.Arn}/*
+
+  # Upload chat interface HTML
+  ChatInterface:
+    Type: Custom::S3Upload
+    DependsOn: ApiDeployment
+    Properties:
+      ServiceToken: !GetAtt UploadLambdaFunction.Arn
+      Bucket: !Ref ChatInterfaceBucket
+      Key: index.html
+      ApiUrl: !Sub https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod/analyze
+      Content: |
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Code Analysis Chat</title>
+            <style>
+                body { font-family: Arial, sans-serif; margin: 20px; }
+                #chat-container { max-width: 800px; margin: 0 auto; }
+                #messages { height: 400px; overflow-y: auto; border: 1px solid #ccc; padding: 10px; margin-bottom: 10px; }
+                #input-container { display: flex; gap: 10px; }
+                #question-input { flex-grow: 1; padding: 5px; }
+                button { padding: 5px 15px; }
+            </style>
+        </head>
+        <body>
+            <div id="chat-container">
+                <h1>Code Analysis Chat</h1>
+                <div id="file-input">
+                    <input type="text" id="file-key" placeholder="Enter S3 file key">
+                </div>
+                <div id="messages"></div>
+                <div id="input-container">
+                    <input type="text" id="question-input" placeholder="Ask a question about the code...">
+                    <button onclick="sendQuestion()">Send</button>
+                </div>
+            </div>
+            <script>
+                const apiUrl = 'REPLACE_WITH_API_URL';
+                
+                async function sendQuestion() {
+                    const fileKey = document.getElementById('file-key').value;
+                    const question = document.getElementById('question-input').value;
+                    const messagesDiv = document.getElementById('messages');
+                    
+                    // Add user question to chat
+                    messagesDiv.innerHTML += `<p><strong>You:</strong> ${question}</p>`;
+                    
+                    try {
+                        console.log('Sending request to:', apiUrl);
+                        const response = await fetch(apiUrl, {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'Accept': 'application/json'
+                            },
+                            mode: 'cors',
+                            body: JSON.stringify({
+                                file_key: fileKey,
+                                question: question
+                            })
+                        });
+                        
+                        if (!response.ok) {
+                            throw new Error(`HTTP error! status: ${response.status}`);
+                        }
+                        const text = await response.text();
+                        console.log('Response text:', text);
+                        
+                        let data;
+                        try {
+                            data = JSON.parse(text);
+                        } catch (e) {
+                            console.error('Failed to parse response:', text);
+                            throw new Error('Invalid JSON response from server');
+                        }
+                        
+                        if (data.error) {
+                            throw new Error(data.error);
+                        }
+                        
+                        const message = data.message || data.body || 'No response content';
+                        messagesDiv.innerHTML += `<p><strong>Assistant:</strong> ${message}</p>`;
+                    } catch (error) {
+                        messagesDiv.innerHTML += `<p><strong>Error:</strong> ${error}</p>`;
+                    }
+                    
+                    document.getElementById('question-input').value = '';
+                    messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                }
+            </script>
+        </body>
+        </html>
+
+  # Lambda function for uploading chat interface to S3
+  UploadLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt UploadLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+
+          def handler(event, context):
+              try:
+                  if event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                      s3 = boto3.client('s3')
+                      bucket = event['ResourceProperties']['Bucket']
+                      key = event['ResourceProperties']['Key']
+                      content = event['ResourceProperties']['Content']
+                      
+                      # Get the API URL from the custom resource properties
+                      api_url = event['ResourceProperties']['ApiUrl']
+                      
+                      # Replace the placeholder with actual API URL
+                      content = content.replace('REPLACE_WITH_API_URL', api_url)
+                      
+                      s3.put_object(
+                          Bucket=bucket,
+                          Key=key,
+                          Body=content,
+                          ContentType='text/html'
+                      )
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+      Runtime: python3.9
+      Timeout: 60
+
+  # IAM role for upload Lambda
+  UploadLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CloudFormationAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:DescribeStacks
+                Resource: !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/*
+        - PolicyName: S3UploadAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub ${ChatInterfaceBucket.Arn}/*
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod/analyze
+
+  ChatInterface:
+    Description: URL for the chat interface
+    Value: !Sub http://${ChatInterfaceBucket.WebsiteURL}
