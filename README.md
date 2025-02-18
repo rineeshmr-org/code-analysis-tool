@@ -104,5 +104,5 @@ To remove all created resources:
 
 ## Support
 
-For issues or questions, please create a GitHub issue or contact [your-contact-info].
-```
+For issues or questions, please create a GitHub issue or contact rineeshmr@gmail.com.
+
