@@ -33,7 +33,7 @@ A secure, serverless app that connects S3-stored code with Claude 3 Sonnet throu
 ## Deployment Instructions
 
 ### Option 1: One-Click Deployment
-1. Click the "Deploy to AWS" button below:
+1. Click the "Deploy to AWS" button below-
    [![Deploy to AWS](https://d2908q01vomqb2.cloudfront.net/f1f836cb4ea6efb2a0b1b99f41ad8b103eff4b59/2017/02/10/launchdark.gif)](https://console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/new?stackName=code-analysis&templateURL=https://your-template-url.com)
 
 2. Enter required parameters:
