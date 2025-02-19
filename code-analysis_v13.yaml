@@ -1,0 +1,971 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "CloudFormation template for deploying a code analysis solution using AWS Bedrock Claude"
+
+Parameters:
+  AWSAccountId:
+    Type: String
+    Description: AWS Account ID
+    AllowedPattern: "[0-9]{12}"
+
+  S3BucketName:
+    Type: String
+    Description: Name of the S3 bucket to store code files
+    AllowedPattern: "[a-zA-Z0-9.-]*"
+
+Resources:
+  # S3 Bucket for storing code files
+  CodeStorageBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref S3BucketName
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  # Lambda execution role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::${S3BucketName}
+                  - !Sub arn:aws:s3:::${S3BucketName}/*
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - "arn:aws:bedrock:*::foundation-model/*"
+              - Effect: Allow
+                Action:
+                  - bedrock:ListFoundationModels
+                  - bedrock:GetFoundationModel
+                Resource: "*"
+
+  # Lambda function for processing code and interacting with Bedrock
+
+  CodeAnalysisFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import re
+          import base64
+          from html import escape
+
+          def handler(event, context):
+              try:
+                  print("Received event:", json.dumps(event))  # Debug log
+                  
+                  # Parse the incoming event body
+                  if isinstance(event.get('body'), str):
+                      body = json.loads(event['body'])
+                  else:
+                      body = event.get('body', {})
+                  
+                  print("Parsed body:", json.dumps(body))  # Debug log
+                  
+                  file_key = body.get('file_key')
+                  question = body.get('question')
+                  
+                  # Validate that file_key is provided
+                  if not file_key or file_key.strip() == '':
+                      # Create user-friendly message advising to provide a file
+                      error_message = "Please provide a code file to analyze. This assistant is designed to analyze specific code files only."
+                      html_message = f"<div><p>{error_message}</p><p>To use this assistant:</p><ol><li>Enter the S3 file path to the code you want to analyze in the input field above</li><li>Then ask your question about that specific code</li></ol></div>"
+                      
+                      return {
+                          'statusCode': 400,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*',
+                              'Access-Control-Allow-Headers': 'Content-Type',
+                              'Access-Control-Allow-Methods': 'OPTIONS,POST'
+                          },
+                          'body': json.dumps({
+                              'message': error_message,
+                              'html_message': html_message
+                          })
+                      }
+                  
+                  # Initialize Bedrock client
+                  bedrock = boto3.client(
+                      service_name='bedrock-runtime',
+                      region_name='us-east-1'
+                  )
+                  print("Initialized Bedrock client")  # Debug log
+                  
+                  # Get file content from S3
+                  file_content = ""
+                  s3 = boto3.client('s3')
+                  bucket = os.environ['BUCKET_NAME']
+                  try:
+                      print(f"Attempting to read file {file_key} from bucket {bucket}")  # Debug log
+                      response = s3.get_object(Bucket=bucket, Key=file_key)
+                      file_content = response['Body'].read().decode('utf-8')
+                      print("Successfully read file from S3")  # Debug log
+                  except Exception as e:
+                      error_str = str(e)
+                      print(f"Error reading file from S3: {error_str}")
+                      error_message = f"Unable to access the specified file. Please verify the file path is correct and the file exists in the S3 bucket."
+                      html_message = f"<div><p><strong>Error:</strong> {error_message}</p><p>Technical details: {escape(error_str)}</p></div>"
+                      
+                      return {
+                          'statusCode': 404,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*',
+                              'Access-Control-Allow-Headers': 'Content-Type',
+                              'Access-Control-Allow-Methods': 'OPTIONS,POST'
+                          },
+                          'body': json.dumps({
+                              'message': error_message,
+                              'html_message': html_message
+                          })
+                      }
+                  
+                  # Prepare message for Claude
+                  messages = [
+                      {
+                          "role": "user",
+                          "content": f"""Here is the code from the file:
+                          {file_content}
+                          
+                          Question:
+                          {question}
+                          
+                          Please analyze the code and answer the question. Format your response using Markdown for better readability. Use headings, bullet points, code blocks, and other formatting as appropriate. 
+                          
+                          Important: Your analysis must be confined to this specific code file only."""
+                      }
+                  ]
+                  
+                  print("Preparing to call Bedrock")  # Debug log
+                  
+                  # Call Bedrock with proper parameters
+                  try:
+                      response = bedrock.invoke_model(
+                          modelId='anthropic.claude-3-sonnet-20240229-v1:0',
+                          contentType='application/json',
+                          accept='application/json',
+                          body=json.dumps({
+                              "messages": messages,
+                              "max_tokens": 2048,
+                              "temperature": 0.7,
+                              "anthropic_version": "bedrock-2023-05-31"
+                          })
+                      )
+                      print("Successfully called Bedrock")  # Debug log
+                      
+                      # Parse response
+                      response_body = json.loads(response['body'].read().decode())
+                      assistant_message = response_body['content'][0]['text']
+                      print("Successfully parsed Bedrock response")  # Debug log
+                      
+                      # A simple markdown to HTML converter for basic formatting
+                      html_message = markdown_to_html(assistant_message)
+                      
+                      return {
+                          'statusCode': 200,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*',
+                              'Access-Control-Allow-Headers': 'Content-Type',
+                              'Access-Control-Allow-Methods': 'OPTIONS,POST'
+                          },
+                          'body': json.dumps({
+                              'message': assistant_message,
+                              'html_message': html_message
+                          })
+                      }
+                  except Exception as bedrock_error:
+                      print(f"Error calling Bedrock: {str(bedrock_error)}")  # Debug log
+                      raise bedrock_error
+                  
+              except Exception as e:
+                  print(f"Error in Lambda: {str(e)}")
+                  import traceback
+                  print("Full traceback:", traceback.format_exc())  # Full error traceback
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*',
+                          'Access-Control-Allow-Headers': 'Content-Type',
+                          'Access-Control-Allow-Methods': 'OPTIONS,POST'
+                      },
+                      'body': json.dumps({
+                          'error': f"Error processing request: {str(e)}"
+                      })
+                  }
+
+          def markdown_to_html(md_text):
+              """
+              Simple markdown to HTML converter for basic formatting.
+              Handles headings, code blocks, lists, and basic styling.
+              """
+              html = escape(md_text)
+              
+              # Handle code blocks (```)
+              code_block_pattern = r'```(\w*)\n(.*?)\n```'
+              def code_block_replacement(match):
+                  lang = match.group(1)
+                  code = match.group(2)
+                  return f'<pre><code class="language-{lang}">{escape(code)}</code></pre>'
+              html = re.sub(code_block_pattern, code_block_replacement, html, flags=re.DOTALL)
+              
+              # Handle inline code (`)
+              html = re.sub(r'`([^`]+)`', r'<code>\1</code>', html)
+              
+              # Handle headings
+              html = re.sub(r'^# (.*?)$', r'<h1>\1</h1>', html, flags=re.MULTILINE)
+              html = re.sub(r'^## (.*?)$', r'<h2>\1</h2>', html, flags=re.MULTILINE)
+              html = re.sub(r'^### (.*?)$', r'<h3>\1</h3>', html, flags=re.MULTILINE)
+              html = re.sub(r'^#### (.*?)$', r'<h4>\1</h4>', html, flags=re.MULTILINE)
+              
+              # Handle unordered lists
+              html = re.sub(r'^\* (.*?)$', r'<li>\1</li>', html, flags=re.MULTILINE)
+              html = re.sub(r'^- (.*?)$', r'<li>\1</li>', html, flags=re.MULTILINE)
+              html = re.sub(r'(<li>.*?</li>\n)+', r'<ul>\g<0></ul>', html, flags=re.DOTALL)
+              
+              # Handle ordered lists
+              html = re.sub(r'^\d+\. (.*?)$', r'<li>\1</li>', html, flags=re.MULTILINE)
+              html = re.sub(r'(<li>.*?</li>\n)+', r'<ol>\g<0></ol>', html, flags=re.DOTALL)
+              
+              # Handle bold and italic
+              html = re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', html)
+              html = re.sub(r'\*(.*?)\*', r'<em>\1</em>', html)
+              
+              # Handle paragraphs
+              html = re.sub(r'\n\n(.*?)\n\n', r'<p>\1</p>\n\n', html, flags=re.DOTALL)
+              
+              # Handle line breaks
+              html = html.replace('\n', '<br>')
+              
+              return html
+      Runtime: python3.9
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref S3BucketName
+
+  # API Gateway REST API
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: CodeAnalysisAPI
+      Description: API for code analysis chat interface
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  # Enable CORS for the entire API
+  ApiGatewayCORSSettings:
+    Type: "AWS::ApiGateway::GatewayResponse"
+    Properties:
+      ResponseParameters:
+        gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+        gatewayresponse.header.Access-Control-Allow-Headers: "'*'"
+        gatewayresponse.header.Access-Control-Allow-Methods: "'*'"
+      ResponseType: DEFAULT_4XX
+      RestApiId: !Ref ApiGateway
+
+  ApiGatewayCORSSettings5XX:
+    Type: "AWS::ApiGateway::GatewayResponse"
+    Properties:
+      ResponseParameters:
+        gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+        gatewayresponse.header.Access-Control-Allow-Headers: "'*'"
+        gatewayresponse.header.Access-Control-Allow-Methods: "'*'"
+      ResponseType: DEFAULT_5XX
+      RestApiId: !Ref ApiGateway
+
+  # API Gateway Resource
+  ApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: analyze
+      RestApiId: !Ref ApiGateway
+
+  # API Gateway Method
+  ApiMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      HttpMethod: POST
+      ResourceId: !Ref ApiResource
+      RestApiId: !Ref ApiGateway
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CodeAnalysisFunction.Arn}/invocations
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # Enable CORS on the resource
+  ResourceCORS:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: |
+                {}
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: |
+            {"statusCode": 200}
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          ResponseModels:
+            application/json: "Empty"
+      ResourceId: !Ref ApiResource
+      RestApiId: !Ref ApiGateway
+
+  # API Gateway Deployment
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: ApiMethod
+    Properties:
+      RestApiId: !Ref ApiGateway
+      StageName: prod
+
+  # Lambda Permission for API Gateway
+  LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref CodeAnalysisFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/*/*
+
+  # Simple chat interface hosted in S3
+  ChatInterfaceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      WebsiteConfiguration:
+        IndexDocument: index.html
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+
+  ChatInterfaceBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ChatInterfaceBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action: s3:GetObject
+            Resource: !Sub ${ChatInterfaceBucket.Arn}/*
+
+  # Upload chat interface HTML
+  # Upload chat interface HTML
+  ChatInterface:
+    Type: Custom::S3Upload
+    DependsOn: ApiDeployment
+    Properties:
+      ServiceToken: !GetAtt UploadLambdaFunction.Arn
+      Bucket: !Ref ChatInterfaceBucket
+      Key: index.html
+      ApiUrl: !Sub https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod/analyze
+      Content: |
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Code Analysis Chat</title>
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/css/bootstrap.min.css" rel="stylesheet">
+            <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/styles/github.min.css">
+            <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.7.0/highlight.min.js"></script>
+            <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/4.0.2/marked.min.js"></script>
+            <style>
+                body {
+                    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                    background-color: #f8f9fa;
+                    margin: 0;
+                    padding: 0;
+                    height: 100vh;
+                    display: flex;
+                    flex-direction: column;
+                }
+                .header {
+                    background: linear-gradient(135deg, #4158D0, #C850C0);
+                    color: white;
+                    padding: 20px 0;
+                    text-align: center;
+                    box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+                }
+                .main-container {
+                    max-width: 1000px;
+                    margin: 0 auto;
+                    padding: 20px;
+                    flex-grow: 1;
+                    display: flex;
+                    flex-direction: column;
+                }
+                .file-input-container {
+                    background-color: white;
+                    border-radius: 10px;
+                    padding: 15px;
+                    margin-bottom: 20px;
+                    box-shadow: 0 2px 10px rgba(0,0,0,0.05);
+                }
+                .chat-container {
+                    background-color: white;
+                    border-radius: 10px;
+                    flex-grow: 1;
+                    display: flex;
+                    flex-direction: column;
+                    box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+                    overflow: hidden;
+                }
+                .messages {
+                    flex-grow: 1;
+                    overflow-y: auto;
+                    padding: 20px;
+                    display: flex;
+                    flex-direction: column;
+                    gap: 20px;
+                    height: 500px;
+                }
+                .message {
+                    max-width: 85%;
+                    padding: 15px;
+                    border-radius: 10px;
+                    position: relative;
+                    animation: fadeIn 0.3s ease-in-out;
+                    box-shadow: 0 2px 5px rgba(0,0,0,0.05);
+                }
+                @keyframes fadeIn {
+                    from { opacity: 0; transform: translateY(10px); }
+                    to { opacity: 1; transform: translateY(0); }
+                }
+                .user-message {
+                    align-self: flex-end;
+                    background-color: #e9f5ff;
+                    border-bottom-right-radius: 0;
+                }
+                .assistant-message {
+                    align-self: flex-start;
+                    background-color: #f8f8f8;
+                    border-bottom-left-radius: 0;
+                }
+                .message-content {
+                    word-wrap: break-word;
+                }
+                .assistant-message .message-content {
+                    line-height: 1.6;
+                    color: #333;
+                }
+                .user-message .message-content {
+                    color: #0a58ca;
+                }
+                .message-header {
+                    display: flex;
+                    align-items: center;
+                    margin-bottom: 8px;
+                    font-weight: 600;
+                }
+                .user-header {
+                    color: #0a58ca;
+                    justify-content: flex-end;
+                }
+                .assistant-header {
+                    color: #444;
+                }
+                .avatar {
+                    width: 30px;
+                    height: 30px;
+                    border-radius: 50%;
+                    margin-right: 10px;
+                    background-size: cover;
+                    background-position: center;
+                }
+                .assistant-avatar {
+                    background-image: url('https://placehold.co/100x100/4158D0/FFFFFF?text=AI');
+                }
+                .user-avatar {
+                    background-image: url('https://placehold.co/100x100/C850C0/FFFFFF?text=U');
+                    margin-left: 10px;
+                    margin-right: 0;
+                    order: 2;
+                }
+                .input-container {
+                    display: flex;
+                    padding: 15px;
+                    background-color: #f8f8f8;
+                    border-top: 1px solid #eaeaea;
+                }
+                .question-input {
+                    flex-grow: 1;
+                    padding: 12px 15px;
+                    border: 1px solid #ced4da;
+                    border-radius: 50px;
+                    outline: none;
+                    transition: all 0.3s;
+                    font-size: 16px;
+                }
+                .question-input:focus {
+                    border-color: #4158D0;
+                    box-shadow: 0 0 0 3px rgba(65, 88, 208, 0.15);
+                }
+                .send-button {
+                    margin-left: 10px;
+                    padding: 0 25px;
+                    background: linear-gradient(135deg, #4158D0, #C850C0);
+                    color: white;
+                    border: none;
+                    border-radius: 50px;
+                    cursor: pointer;
+                    transition: all 0.3s;
+                    font-weight: 600;
+                }
+                .send-button:hover {
+                    transform: translateY(-2px);
+                    box-shadow: 0 4px 10px rgba(0,0,0,0.15);
+                }
+                .send-button:active {
+                    transform: translateY(0);
+                }
+                .loading {
+                    display: none;
+                    align-items: center;
+                    justify-content: center;
+                    padding: 20px;
+                    color: #666;
+                }
+                .loading-spinner {
+                    width: 30px;
+                    height: 30px;
+                    border: 3px solid #f3f3f3;
+                    border-top: 3px solid #4158D0;
+                    border-radius: 50%;
+                    animation: spin 1s linear infinite;
+                    margin-right: 10px;
+                }
+                @keyframes spin {
+                    0% { transform: rotate(0deg); }
+                    100% { transform: rotate(360deg); }
+                }
+                .code {
+                    border-radius: 5px;
+                    margin: 10px 0;
+                    overflow: auto;
+                }
+                pre {
+                    margin: 0 !important;
+                }
+                code {
+                    font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+                }
+                .copy-button {
+                    position: absolute;
+                    right: 10px;
+                    top: 10px;
+                    padding: 3px 8px;
+                    background-color: rgba(255,255,255,0.9);
+                    border: 1px solid #ddd;
+                    border-radius: 4px;
+                    cursor: pointer;
+                    font-size: 12px;
+                }
+                .copy-button:hover {
+                    background-color: #f0f0f0;
+                }
+                
+                /* Mobile Responsive Styles */
+                @media (max-width: 768px) {
+                    .main-container {
+                        padding: 10px;
+                    }
+                    .message {
+                        max-width: 90%;
+                    }
+                    .file-input-container label {
+                        display: block;
+                        margin-bottom: 8px;
+                    }
+                }
+            </style>
+        </head>
+        <body>
+            <div class="header">
+                <h1>Code Analysis Assistant</h1>
+                <p>Powered by Claude</p>
+            </div>
+            
+            <div class="main-container">
+                <div class="file-input-container">
+                    <div class="mb-3">
+                        <label for="file-key" class="form-label">S3 File Path</label>
+                        <div class="input-group">
+                            <span class="input-group-text">s3://bucket/</span>
+                            <input type="text" class="form-control" id="file-key" placeholder="path/to/your/file.py">
+                        </div>
+                        <div class="form-text text-muted">Enter the file path from your S3 bucket to analyze</div>
+                    </div>
+                </div>
+                
+                <div class="chat-container">
+                    <div class="messages" id="messages">
+                        <div class="message assistant-message">
+                            <div class="message-header assistant-header">
+                                <div class="avatar assistant-avatar"></div>
+                                <span>Code Analysis Assistant</span>
+                            </div>
+                            <div class="message-content">
+                                Hello! I'm your code analysis assistant powered by Claude. If you'd like me to analyze some code, please:
+                                <ol>
+                                    <li>Enter the S3 file path to the code you want to analyze</li>
+                                    <li>Ask me a specific question about the code</li>
+                                </ol>
+                                I can help with understanding code structure, finding bugs, suggesting improvements, explaining algorithms, and more!
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="loading" id="loading">
+                        <div class="loading-spinner"></div>
+                        <div>Analyzing your code...</div>
+                    </div>
+                    
+                    <div class="input-container">
+                        <input type="text" class="question-input" id="question-input" placeholder="Ask a question about the code..." onkeypress="handleKeyPress(event)">
+                        <button class="send-button" onclick="sendQuestion()">Send</button>
+                    </div>
+                </div>
+            </div>
+            
+            <script>
+                const apiUrl = 'REPLACE_WITH_API_URL';
+                const messagesDiv = document.getElementById('messages');
+                const loadingDiv = document.getElementById('loading');
+                
+                // Configure marked.js
+                marked.setOptions({
+                    highlight: function(code, lang) {
+                        if (lang && hljs.getLanguage(lang)) {
+                            return hljs.highlight(code, { language: lang }).value;
+                        }
+                        return hljs.highlightAuto(code).value;
+                    },
+                    breaks: true,
+                    gfm: true
+                });
+                
+                function handleKeyPress(event) {
+                    if (event.key === 'Enter') {
+                        sendQuestion();
+                    }
+                }
+                
+                async function sendQuestion() {
+                    const fileKey = document.getElementById('file-key').value;
+                    const question = document.getElementById('question-input').value.trim();
+                    
+                    if (!question) return;
+                    
+                    // Add user question to chat
+                    addMessage(question, 'user');
+                    
+                    // Clear input and show loading indicator
+                    document.getElementById('question-input').value = '';
+                    loadingDiv.style.display = 'flex';
+                    
+                    try {
+                        console.log('Sending request to:', apiUrl);
+                        const response = await fetch(apiUrl, {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'Accept': 'application/json'
+                            },
+                            mode: 'cors',
+                            body: JSON.stringify({
+                                file_key: fileKey,
+                                question: question
+                            })
+                        });
+                        
+                        // Read the response text regardless of status code
+                        const text = await response.text();
+                        console.log('Response text:', text);
+                        
+                        let data;
+                        try {
+                            data = JSON.parse(text);
+                        } catch (e) {
+                            console.error('Failed to parse response:', text);
+                            throw new Error('Invalid JSON response from server');
+                        }
+                        
+                        // If the response wasn't ok, but we have a message, use it
+                        if (!response.ok) {
+                            if (data.html_message) {
+                                // Display the formatted error message from backend
+                                addMessage(data.html_message, 'assistant', true);
+                            } else if (data.message) {
+                                // Fall back to plain message if html version not available
+                                addMessage(data.message, 'assistant', true);
+                            } else if (data.error) {
+                                // If there's an error field, use it
+                                throw new Error(data.error);
+                            } else {
+                                // Last resort, generic error with status code
+                                throw new Error(`Request failed with status code ${response.status}`);
+                            }
+                            return;
+                        }
+                        
+                        // For successful responses, continue as before
+                        if (data.error) {
+                            throw new Error(data.error);
+                        }
+                        
+                        // Use the HTML message if available, otherwise convert markdown to HTML
+                        let messageHtml = data.html_message;
+                        if (!messageHtml && data.message) {
+                            messageHtml = marked.parse(data.message);
+                        }
+                        
+                        // Add assistant response to chat
+                        addMessage(messageHtml, 'assistant', true);
+                        
+                    } catch (error) {
+                        addErrorMessage(error.toString());
+                    } finally {
+                        // Hide loading indicator
+                        loadingDiv.style.display = 'none';
+                        
+                        // Scroll to bottom
+                        messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                    }
+                }
+                
+                function addMessage(content, sender, isHtml = false) {
+                    const messageDiv = document.createElement('div');
+                    messageDiv.className = `message ${sender}-message`;
+                    
+                    const headerDiv = document.createElement('div');
+                    headerDiv.className = `message-header ${sender}-header`;
+                    
+                    const avatarDiv = document.createElement('div');
+                    avatarDiv.className = `avatar ${sender}-avatar`;
+                    
+                    const nameSpan = document.createElement('span');
+                    nameSpan.textContent = sender === 'user' ? 'You' : 'Code Analysis Assistant';
+                    
+                    if (sender === 'user') {
+                        headerDiv.appendChild(nameSpan);
+                        headerDiv.appendChild(avatarDiv);
+                    } else {
+                        headerDiv.appendChild(avatarDiv);
+                        headerDiv.appendChild(nameSpan);
+                    }
+                    
+                    const contentDiv = document.createElement('div');
+                    contentDiv.className = 'message-content';
+                    
+                    if (isHtml) {
+                        contentDiv.innerHTML = content;
+                        
+                        // Add copy buttons to code blocks
+                        setTimeout(() => {
+                            const codeBlocks = contentDiv.querySelectorAll('pre code');
+                            codeBlocks.forEach((block, index) => {
+                                const pre = block.parentNode;
+                                pre.style.position = 'relative';
+                                
+                                const copyButton = document.createElement('button');
+                                copyButton.className = 'copy-button';
+                                copyButton.textContent = 'Copy';
+                                copyButton.onclick = function() {
+                                    navigator.clipboard.writeText(block.textContent);
+                                    copyButton.textContent = 'Copied!';
+                                    setTimeout(() => { copyButton.textContent = 'Copy'; }, 2000);
+                                };
+                                
+                                pre.appendChild(copyButton);
+                            });
+                        }, 100);
+                    } else {
+                        contentDiv.textContent = content;
+                    }
+                    
+                    messageDiv.appendChild(headerDiv);
+                    messageDiv.appendChild(contentDiv);
+                    messagesDiv.appendChild(messageDiv);
+                    
+                    // Apply syntax highlighting to code blocks
+                    if (isHtml) {
+                        document.querySelectorAll('pre code').forEach((block) => {
+                            hljs.highlightElement(block);
+                        });
+                    }
+                    
+                    // Scroll to bottom
+                    messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                }
+                
+                function addErrorMessage(errorText) {
+                    const messageDiv = document.createElement('div');
+                    messageDiv.className = 'message assistant-message';
+                    
+                    const headerDiv = document.createElement('div');
+                    headerDiv.className = 'message-header assistant-header';
+                    
+                    const avatarDiv = document.createElement('div');
+                    avatarDiv.className = 'avatar assistant-avatar';
+                    
+                    const nameSpan = document.createElement('span');
+                    nameSpan.textContent = 'Error';
+                    
+                    headerDiv.appendChild(avatarDiv);
+                    headerDiv.appendChild(nameSpan);
+                    
+                    const contentDiv = document.createElement('div');
+                    contentDiv.className = 'message-content';
+                    contentDiv.innerHTML = `<div style="color: #d9534f;"><strong>Something went wrong:</strong><br>${errorText}</div>`;
+                    
+                    messageDiv.appendChild(headerDiv);
+                    messageDiv.appendChild(contentDiv);
+                    messagesDiv.appendChild(messageDiv);
+                    
+                    // Scroll to bottom
+                    messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                }
+            </script>
+        </body>
+        </html>
+
+  # Lambda function for uploading chat interface to S3
+  UploadLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt UploadLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+
+          def handler(event, context):
+              try:
+                  if event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                      s3 = boto3.client('s3')
+                      bucket = event['ResourceProperties']['Bucket']
+                      key = event['ResourceProperties']['Key']
+                      content = event['ResourceProperties']['Content']
+                      
+                      # Get the API URL from the custom resource properties
+                      api_url = event['ResourceProperties']['ApiUrl']
+                      
+                      # Replace the placeholder with actual API URL
+                      content = content.replace('REPLACE_WITH_API_URL', api_url)
+                      
+                      s3.put_object(
+                          Bucket=bucket,
+                          Key=key,
+                          Body=content,
+                          ContentType='text/html'
+                      )
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+      Runtime: python3.9
+      Timeout: 60
+
+  # IAM role for upload Lambda
+  UploadLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CloudFormationAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:DescribeStacks
+                Resource: !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/*
+        - PolicyName: S3UploadAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub ${ChatInterfaceBucket.Arn}/*
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod/analyze
+
+  ChatInterface:
+    Description: URL for the chat interface
+    Value: !Sub http://${ChatInterfaceBucket.WebsiteURL}
